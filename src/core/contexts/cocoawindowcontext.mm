@@ -208,6 +208,11 @@ namespace QWK {
             }
         }
 
+        void setCloseButtonOnly(bool enabled) {
+            closeButtonOnly = enabled;
+            setSystemButtonVisible(systemButtonVisible);
+        }
+
         // System buttons visibility
         void setSystemButtonVisible(bool visible) {
             systemButtonVisible = visible;
@@ -259,9 +264,21 @@ namespace QWK {
             // QRect::center() 对偶数高度向上偏一像素；使用几何中心与 QML 标题对齐。
             QPointF center = QRectF(screenRectCallback(QSize(viewSize.width, titlebarHeight))).center();
 
-            // The origin of the NSWindow coordinate system is in the lower left corner, we
-            // do the necessary transformations
-            center.ry() = titlebarHeight - center.y();
+            // 用视图转换处理标题栏容器偏移与 flipped 坐标，而非假设其原点在窗口顶部。
+            NSPoint contentCenter = NSMakePoint(center.x(),
+                nsview.isFlipped ? center.y() : viewSize.height - center.y());
+            NSPoint buttonCenter = [nsview convertPoint:contentCenter toView:titlebar];
+            center = QPointF(buttonCenter.x, buttonCenter.y);
+
+            // 仅含关闭按钮的对话框以该按钮居中，不再预留完整交通灯组。
+            const bool closeOnly = closeButtonOnly || !([nsview window].styleMask & NSWindowStyleMaskMiniaturizable);
+            if (closeOnly) {
+                midButton.hidden = YES;
+                rightButton.hidden = YES;
+                [leftButton setFrameOrigin:NSMakePoint(center.x() - width / 2,
+                                                       center.y() - height / 2)];
+                return;
+            }
 
             // Mid button
             NSPoint centerOrigin = {
@@ -346,6 +363,18 @@ namespace QWK {
             return true;
         }
 
+        // 自绘窗口阴影时显式关闭系统阴影，避免两层阴影及透明客户区的黑边。
+        void setWindowShadowEnabled(bool enabled) {
+            windowShadowEnabled = enabled;
+            auto window = [nsview window];
+            window.hasShadow = enabled;
+            if (!enabled) {
+                window.opaque = NO;
+                window.backgroundColor = [NSColor clearColor];
+            }
+            [window invalidateShadow];
+        }
+
         // System title bar
         void setSystemTitleBarVisible(const bool visible) {
             auto nswindow = [nsview window];
@@ -362,7 +391,7 @@ namespace QWK {
             }
             nswindow.titlebarAppearsTransparent = (visible ? NO : YES);
             nswindow.titleVisibility = (visible || (nswindow.styleMask & NSWindowStyleMaskFullScreen) ? NSWindowTitleVisible : NSWindowTitleHidden);
-            nswindow.hasShadow = YES;
+            nswindow.hasShadow = windowShadowEnabled;
             // nswindow.showsToolbarButton = NO;
             nswindow.movableByWindowBackground = NO;
             nswindow.movable = NO; // This line causes the window in the wrong position when
@@ -512,6 +541,8 @@ namespace QWK {
         QWK_NSViewObserver* observer = nil;
 
         bool systemButtonVisible = true;
+        bool windowShadowEnabled = true;
+        bool closeButtonOnly = false;
         ScreenRectCallback screenRectCallback;
 
         static inline QWK_NSWindowObserver *windowObserver = nil;
@@ -748,8 +779,10 @@ namespace QWK {
         // Allocate new resources
         const auto proxy = ensureWindowProxy(winId);
         if (proxy) {
+            proxy->setCloseButtonOnly(windowAttribute(QStringLiteral("close-button-only")).toBool());
             proxy->setSystemButtonVisible(!windowAttribute(QStringLiteral("no-system-buttons")).toBool());
             proxy->setScreenRectCallback(m_systemButtonAreaCallback);
+            proxy->setWindowShadowEnabled(!windowAttribute(QStringLiteral("no-window-shadow")).toBool());
             proxy->setSystemTitleBarVisible(false);
         }
     }
@@ -759,6 +792,21 @@ namespace QWK {
         Q_UNUSED(oldAttribute)
 
         Q_ASSERT(m_windowId);
+
+        if (key == QStringLiteral("close-button-only")) {
+            if (attribute.userType() != QMetaType::Bool)
+                return false;
+            const auto proxy = ensureWindowProxy(m_windowId);
+            proxy->setCloseButtonOnly(attribute.toBool());
+            return true;
+        }
+
+        if (key == QStringLiteral("no-window-shadow")) {
+            if (attribute.userType() != QMetaType::Bool)
+                return false;
+            ensureWindowProxy(m_windowId)->setWindowShadowEnabled(!attribute.toBool());
+            return true;
+        }
 
         if (key == QStringLiteral("no-system-buttons")) {
 #if (QT_VERSION < QT_VERSION_CHECK(6, 0, 0))
