@@ -240,15 +240,24 @@ namespace QWK {
             const auto &midButton = buttons[1];
             const auto &rightButton = buttons[2];
 
-            auto titlebar = rightButton.superview;
+            // 对话框可能没有最小化/缩放按钮，不能从 nil 读取零尺寸来定位关闭按钮。
+            NSButton *reference = midButton ? midButton : (leftButton ? leftButton : rightButton);
+            if (!reference || !reference.superview) {
+                return;
+            }
+            auto titlebar = reference.superview;
             int titlebarHeight = titlebar.frame.size.height;
-
-            auto spacing = midButton.frame.origin.x - leftButton.frame.origin.x;
-            auto width = midButton.frame.size.width;
-            auto height = midButton.frame.size.height;
+            auto width = reference.frame.size.width;
+            auto height = reference.frame.size.height;
+            auto spacing = leftButton && midButton
+                ? midButton.frame.origin.x - leftButton.frame.origin.x
+                : (leftButton && rightButton
+                    ? (rightButton.frame.origin.x - leftButton.frame.origin.x) / 2
+                    : width + 6);
 
             auto viewSize = nsview.frame.size;
-            QPoint center = screenRectCallback(QSize(viewSize.width, titlebarHeight)).center();
+            // QRect::center() 对偶数高度向上偏一像素；使用几何中心与 QML 标题对齐。
+            QPointF center = QRectF(screenRectCallback(QSize(viewSize.width, titlebarHeight))).center();
 
             // The origin of the NSWindow coordinate system is in the lower left corner, we
             // do the necessary transformations
