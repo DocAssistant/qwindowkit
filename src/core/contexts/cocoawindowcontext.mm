@@ -10,6 +10,7 @@
 #include <Cocoa/Cocoa.h>
 
 #include <QtGui/QGuiApplication>
+#include <functional>
 
 #include "qwkglobal_p.h"
 #include "systemwindow_p.h"
@@ -42,6 +43,63 @@ public:
 //
 // Objective C++ Begin
 //
+
+// 标准窗口按钮绘制时会向承载视图查询 _mouseInGroup:。这是 AppKit 的非公开
+// 容器协议，集中封装于 macOS 适配层；按钮图像、点击动作及辅助功能仍由系统提供。
+// 系统升级须运行 nativeMacDialogChrome 的原生悬停像素回归。
+@interface QWK_SystemButtonHost : NSView {
+    NSTrackingArea *trackingArea_;
+    BOOL mouseInside_;
+}
+@end
+
+@implementation QWK_SystemButtonHost
+- (void)refreshButtons {
+    for (NSButton *button in self.subviews) {
+        // macOS 26 的系统按钮缓存图像，仅置 needsDisplay 不能切换叉号。
+        // 在支持该协议时先刷新系统悬停图像；旧系统仍走正常重绘。
+        const SEL refreshHover = NSSelectorFromString(@"mouseEnteredOrExited");
+        if ([button respondsToSelector:refreshHover])
+            [button performSelector:refreshHover];
+        [button setNeedsDisplay:YES];
+    }
+}
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (trackingArea_) {
+        [self removeTrackingArea:trackingArea_];
+        [trackingArea_ release];
+    }
+    trackingArea_ = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+        options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+        owner:self userInfo:nil];
+    [self addTrackingArea:trackingArea_];
+    const NSPoint pointer = [self convertPoint:self.window.mouseLocationOutsideOfEventStream fromView:nil];
+    mouseInside_ = self.window && !self.hidden && NSPointInRect(pointer, self.bounds);
+    [self refreshButtons];
+}
+- (BOOL)_mouseInGroup:(NSButton *)button {
+    Q_UNUSED(button);
+    return mouseInside_;
+}
+- (void)mouseEntered:(NSEvent *)event {
+    Q_UNUSED(event);
+    mouseInside_ = YES;
+    [self refreshButtons];
+}
+- (void)mouseExited:(NSEvent *)event {
+    Q_UNUSED(event);
+    mouseInside_ = NO;
+    [self refreshButtons];
+}
+- (void)dealloc {
+    if (trackingArea_) {
+        [self removeTrackingArea:trackingArea_];
+        [trackingArea_ release];
+    }
+    [super dealloc];
+}
+@end
 
 @interface QWK_NSWindowObserver : NSObject {
 }
@@ -156,6 +214,7 @@ namespace QWK {
         }
 
         ~NSWindowProxy() override {
+            restoreCloseButtonParent();
             [nsview removeObserver:observer forKeyPath:@"window"];
             [observer release];
         }
@@ -209,13 +268,48 @@ namespace QWK {
         }
 
         void setCloseButtonOnly(bool enabled) {
+            if (!enabled)
+                restoreCloseButtonParent();
             closeButtonOnly = enabled;
             setSystemButtonVisible(systemButtonVisible);
+        }
+
+        void setTitleBarHitTest(const std::function<bool(const QPoint &)> &callback,
+                               const std::function<void()> &doubleClick) {
+            titleBarHitTest_ = callback;
+            titleBarDoubleClick_ = doubleClick;
+        }
+
+        bool handleNativeDrag(NSEvent *event) {
+            if (event.type != NSEventTypeLeftMouseDown || !titleBarHitTest_)
+                return false;
+            auto window = nsview.window;
+            if (!window || (window.styleMask & NSWindowStyleMaskFullScreen))
+                return false;
+            const NSPoint local = [nsview convertPoint:event.locationInWindow fromView:nil];
+            for (const auto button : systemButtons()) {
+                if (button && !button.hidden &&
+                    NSPointInRect(local, [button convertRect:button.bounds toView:nsview]))
+                    return false;
+            }
+            const QPoint scene(qRound(local.x), qRound(nsview.isFlipped ? local.y : nsview.bounds.size.height - local.y));
+            if (!titleBarHitTest_(scene))
+                return false;
+            if (event.clickCount % 2 == 0) {
+                if (titleBarDoubleClick_)
+                    titleBarDoubleClick_();
+                return true;
+            }
+            // Qt Quick 可能把整段鼠标序列延后处理，此时 NSApp.currentEvent 已是 mouseUp。
+            // 在 AppKit 分发原生 mouseDown 时接管，保留真实事件与系统触摸板拖移行为。
+            [window performWindowDragWithEvent:event];
+            return true;
         }
 
         // System buttons visibility
         void setSystemButtonVisible(bool visible) {
             systemButtonVisible = visible;
+            closeButtonHost_.hidden = !visible;
             for (const auto &button : systemButtons()) {
                 button.hidden = !visible;
             }
@@ -251,7 +345,7 @@ namespace QWK {
                 return;
             }
             auto titlebar = reference.superview;
-            int titlebarHeight = titlebar.frame.size.height;
+            int titlebarHeight = closeButtonParent_ ? closeButtonParent_.frame.size.height : titlebar.frame.size.height;
             auto width = reference.frame.size.width;
             auto height = reference.frame.size.height;
             auto spacing = leftButton && midButton
@@ -275,8 +369,23 @@ namespace QWK {
             if (closeOnly) {
                 midButton.hidden = YES;
                 rightButton.hidden = YES;
-                [leftButton setFrameOrigin:NSMakePoint(center.x() - width / 2,
-                                                       center.y() - height / 2)];
+                // 自绘标题在客户区内，用独立的原生承载视图同步真实跟踪区域。
+                if (leftButton && (hostedCloseButton_ != leftButton || leftButton.superview != closeButtonHost_)) {
+                    restoreCloseButtonParent();
+                    hostedCloseButton_ = [leftButton retain];
+                    closeButtonParent_ = [leftButton.superview retain];
+                    closeButtonOriginalFrame_ = leftButton.frame;
+                    closeButtonHost_ = [[QWK_SystemButtonHost alloc] initWithFrame:NSZeroRect];
+                    // 放在原生窗口框架内，避免 Qt 内容视图过滤原生按钮的辅助功能节点。
+                    [nsview.superview addSubview:closeButtonHost_ positioned:NSWindowAbove relativeTo:nil];
+                    [closeButtonHost_ addSubview:leftButton];
+                }
+                const NSSize size = leftButton.frame.size;
+                const NSPoint hostCenter = [nsview convertPoint:contentCenter toView:closeButtonHost_.superview];
+                [closeButtonHost_ setFrame:NSMakeRect(hostCenter.x - size.width / 2,
+                    hostCenter.y - size.height / 2, size.width, size.height)];
+                [leftButton setFrameOrigin:NSZeroPoint];
+                [closeButtonHost_ updateTrackingAreas];
                 return;
             }
 
@@ -313,13 +422,27 @@ namespace QWK {
             return {closeBtn, minimizeBtn, zoomBtn};
         }
 
+        void restoreCloseButtonParent() {
+            if (hostedCloseButton_ && closeButtonParent_) {
+                [closeButtonParent_ addSubview:hostedCloseButton_];
+                [hostedCloseButton_ setFrame:closeButtonOriginalFrame_];
+            }
+            [closeButtonHost_ removeFromSuperview];
+            [closeButtonHost_ release];
+            [hostedCloseButton_ release];
+            [closeButtonParent_ release];
+            closeButtonHost_ = nil;
+            hostedCloseButton_ = nil;
+            closeButtonParent_ = nil;
+        }
+
         inline int titleBarHeight() const {
             auto nswindow = [nsview window];
-            if (!nswindow) {
+            if (!nswindow)
                 return 0;
-            }
             NSButton *closeBtn = [nswindow standardWindowButton:NSWindowCloseButton];
-            return closeBtn.superview.frame.size.height;
+            NSView *titlebar = closeBtn == hostedCloseButton_ ? closeButtonParent_ : closeBtn.superview;
+            return titlebar.frame.size.height;
         }
 
         // Blur effect
@@ -394,14 +517,18 @@ namespace QWK {
             nswindow.hasShadow = windowShadowEnabled;
             // nswindow.showsToolbarButton = NO;
             nswindow.movableByWindowBackground = NO;
-            nswindow.movable = NO; // This line causes the window in the wrong position when
-                                   // become fullscreen.
-            [nswindow standardWindowButton:NSWindowCloseButton].hidden = NO;
-            [nswindow standardWindowButton:NSWindowMiniaturizeButton].hidden = NO;
-            [nswindow standardWindowButton:NSWindowZoomButton].hidden = NO;
+            // 命中范围由代理控制，但 AppKit 的原生拖动仍要求窗口允许移动。
+            nswindow.movable = YES;
+            setSystemButtonVisible(systemButtonVisible);
         }
 
         static void replaceImplementations() {
+            // 本地事件入口早于 Qt Quick 的延迟投递；只消费标题栏空白区域的按下。
+            nativeDragMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown
+                handler:^NSEvent *(NSEvent *event) {
+                    auto proxy = g_proxyList->value(reinterpret_cast<WId>(event.window.contentView));
+                    return proxy && proxy->handleNativeDrag(event) ? nil : event;
+                }];
             Method method = class_getInstanceMethod(windowClass, @selector(setStyleMask:));
             oldSetStyleMask = reinterpret_cast<setStyleMaskPtr>(
                 method_setImplementation(method, reinterpret_cast<IMP>(setStyleMask)));
@@ -429,6 +556,10 @@ namespace QWK {
         }
 
         static void restoreImplementations() {
+            if (nativeDragMonitor_) {
+                [NSEvent removeMonitor:nativeDragMonitor_];
+                nativeDragMonitor_ = nil;
+            }
             Method method = class_getInstanceMethod(windowClass, @selector(setStyleMask:));
             method_setImplementation(method, reinterpret_cast<IMP>(oldSetStyleMask));
             oldSetStyleMask = nil;
@@ -538,6 +669,12 @@ namespace QWK {
         Q_DISABLE_COPY(NSWindowProxy)
 
         NSView *nsview = nil;
+        NSButton *hostedCloseButton_ = nil;
+        NSView *closeButtonParent_ = nil;
+        QWK_SystemButtonHost *closeButtonHost_ = nil;
+        NSRect closeButtonOriginalFrame_ = NSZeroRect;
+        std::function<bool(const QPoint &)> titleBarHitTest_;
+        std::function<void()> titleBarDoubleClick_;
         QWK_NSViewObserver* observer = nil;
 
         bool systemButtonVisible = true;
@@ -546,6 +683,7 @@ namespace QWK {
         ScreenRectCallback screenRectCallback;
 
         static inline QWK_NSWindowObserver *windowObserver = nil;
+        static inline id nativeDragMonitor_ = nil;
 
         // NSEvent *lastMouseDownEvent = nil;
 
@@ -649,9 +787,7 @@ namespace QWK {
                 switch (me->button()) {
                     case Qt::LeftButton: {
                         if (inTitleBar) {
-                            // If we call startSystemMove() now but release the mouse without actual
-                            // movement, there will be no MouseReleaseEvent, so we defer it when the
-                            // mouse is actually moving for the first time
+                            // 原生事件由本地 monitor 接管；此处保留 Qt 合成事件的兼容路径。
                             m_windowStatus = PreparingMove;
                             event->accept();
                             return true;
@@ -693,13 +829,23 @@ namespace QWK {
             }
 
             case QEvent::MouseMove: {
+                // 系统拖动可能消耗 release；无按键的移动必须清除旧状态，不能吞掉后续悬停。
+                if (!(me->buttons() & Qt::LeftButton)) {
+                    m_windowStatus = Idle;
+                    break;
+                }
                 switch (m_windowStatus) {
                     case Moving: {
                         return true;
                     }
                     case PreparingMove: {
-                        m_windowStatus = Moving;
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+                        // 触摸板事件尚未具备有效原生拖动事件时，下次移动继续尝试。
+                        m_windowStatus = window->startSystemMove() ? Moving : PreparingMove;
+#else
                         startSystemMove(window);
+                        m_windowStatus = Moving;
+#endif
                         event->accept();
                         return true;
                     }
@@ -779,6 +925,15 @@ namespace QWK {
         // Allocate new resources
         const auto proxy = ensureWindowProxy(winId);
         if (proxy) {
+            proxy->setTitleBarHitTest([this](const QPoint &point) {
+                return isInTitleBarDraggableArea(point);
+            }, [this]() {
+                if (isHostSizeFixed())
+                    return;
+                const auto state = delegate()->getWindowState(host());
+                if (!(state & Qt::WindowFullScreen))
+                    delegate()->setWindowState(host(), state ^ Qt::WindowMaximized);
+            });
             proxy->setCloseButtonOnly(windowAttribute(QStringLiteral("close-button-only")).toBool());
             proxy->setSystemButtonVisible(!windowAttribute(QStringLiteral("no-system-buttons")).toBool());
             proxy->setScreenRectCallback(m_systemButtonAreaCallback);
