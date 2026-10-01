@@ -310,8 +310,10 @@ namespace QWK {
         void setSystemButtonVisible(bool visible) {
             systemButtonVisible = visible;
             closeButtonHost_.hidden = !visible;
-            for (const auto &button : systemButtons()) {
-                button.hidden = !visible;
+            const bool closeOnly = closeButtonOnly || !(nsview.window.styleMask & NSWindowStyleMaskMiniaturizable);
+            const auto buttons = systemButtons();
+            for (size_t i = 0; i < buttons.size(); ++i) {
+                buttons[i].hidden = !visible || (closeOnly && i != 0);
             }
 
             if (!screenRectCallback || !visible) {
