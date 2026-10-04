@@ -34,6 +34,7 @@ public:
         WillExitFullScreen,
         DidExitFullScreen,
         DidResize,
+        DidUpdate,
     };
 
     virtual ~QWK_NSWindowDelegate() = default;
@@ -130,6 +131,10 @@ public:
                                                  selector:@selector(windowDidResize:)
                                                      name:NSWindowDidResizeNotification
                                                    object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowDidUpdate:)
+                                                     name:NSWindowDidUpdateNotification
+                                                   object:nil];
     }
     return self;
 }
@@ -184,6 +189,14 @@ public:
     }
 }
 
+- (void)windowDidUpdate:(NSNotification *)notification {
+    auto nsview = [reinterpret_cast<NSWindow *>(notification.object) contentView];
+    if (auto proxy = QWK::g_proxyList->value(reinterpret_cast<WId>(nsview))) {
+        reinterpret_cast<QWK_NSWindowDelegate *>(proxy)->windowEvent(
+            QWK_NSWindowDelegate::DidUpdate);
+    }
+}
+
 @end
 
 @interface QWK_NSViewObserver : NSObject
@@ -222,6 +235,13 @@ namespace QWK {
         // Delegate
         void windowEvent(NSEventType eventType) override {
             switch (eventType) {
+                case DidUpdate: {
+                    // 窗口共享等系统状态会重建按钮组，且不触发 Qt 几何/焦点变化。
+                    // 在 AppKit 完成本轮更新后恢复原生按钮父层、位置及可见性。
+                    if (closeButtonOnly)
+                        setSystemButtonVisible(systemButtonVisible);
+                    break;
+                }
                 case WillExitFullScreen: {
                     auto nswindow = [nsview window];
                     nswindow.titleVisibility = NSWindowTitleHidden;
@@ -371,8 +391,31 @@ namespace QWK {
             if (closeOnly) {
                 midButton.hidden = YES;
                 rightButton.hidden = YES;
-                // 自绘标题在客户区内，用独立的原生承载视图同步真实跟踪区域。
-                if (leftButton && (hostedCloseButton_ != leftButton || leftButton.superview != closeButtonHost_)) {
+                // 保持系统按钮及其原生父层关系；系统共享/hover/press 依赖此组。
+                // 只平移标题栏容器，使关闭中心与 QML 声明区域一致。
+                NSView *container = leftButton.superview;
+                while (container.superview && container.superview != nsview.superview)
+                    container = container.superview;
+                if (container && container != nsview.superview) {
+                    if (nativeButtonContainer_ != container) {
+                        restoreNativeButtonContainer();
+                        nativeButtonContainer_ = [container retain];
+                        nativeButtonContainerLeft_ = NSMinX(container.frame) - NSMinX(container.superview.bounds);
+                        nativeButtonContainerTop_ = NSMaxY(container.superview.bounds) - NSMaxY(container.frame);
+                    }
+                    const NSPoint actual = [leftButton convertPoint:NSMakePoint(NSMidX(leftButton.bounds), NSMidY(leftButton.bounds)) toView:container.superview];
+                    const NSPoint desired = [nsview convertPoint:contentCenter toView:container.superview];
+                    const NSPoint origin = NSMakePoint(container.frame.origin.x + desired.x - actual.x,
+                        container.frame.origin.y + desired.y - actual.y);
+                    if (!NSEqualPoints(container.frame.origin, origin)) {
+                        [container setFrameOrigin:origin];
+                        [titlebar updateTrackingAreas];
+                    }
+                    return;
+                }
+                // 旧系统没有独立标题栏容器时保留既有回退；须按实际系统复验。
+                const bool rehost = leftButton && (hostedCloseButton_ != leftButton || leftButton.superview != closeButtonHost_);
+                if (rehost) {
                     restoreCloseButtonParent();
                     hostedCloseButton_ = [leftButton retain];
                     closeButtonParent_ = [leftButton.superview retain];
@@ -384,10 +427,17 @@ namespace QWK {
                 }
                 const NSSize size = leftButton.frame.size;
                 const NSPoint hostCenter = [nsview convertPoint:contentCenter toView:closeButtonHost_.superview];
-                [closeButtonHost_ setFrame:NSMakeRect(hostCenter.x - size.width / 2,
-                    hostCenter.y - size.height / 2, size.width, size.height)];
-                [leftButton setFrameOrigin:NSZeroPoint];
-                [closeButtonHost_ updateTrackingAreas];
+                const NSRect hostFrame = NSMakeRect(hostCenter.x - size.width / 2,
+                    hostCenter.y - size.height / 2, size.width, size.height);
+                const bool moved = !NSEqualRects(closeButtonHost_.frame, hostFrame);
+                if (moved)
+                    [closeButtonHost_ setFrame:hostFrame];
+                const bool buttonMoved = !NSEqualPoints(leftButton.frame.origin, NSZeroPoint);
+                if (buttonMoved)
+                    [leftButton setFrameOrigin:NSZeroPoint];
+                // 稳定的窗口更新不重复刷新悬停图像，避免持续重绘。
+                if (rehost || moved || buttonMoved)
+                    [closeButtonHost_ updateTrackingAreas];
                 return;
             }
 
@@ -424,7 +474,18 @@ namespace QWK {
             return {closeBtn, minimizeBtn, zoomBtn};
         }
 
+        void restoreNativeButtonContainer() {
+            if (nativeButtonContainer_) {
+                const NSRect parent = nativeButtonContainer_.superview.bounds;
+                [nativeButtonContainer_ setFrameOrigin:NSMakePoint(NSMinX(parent) + nativeButtonContainerLeft_,
+                    NSMaxY(parent) - nativeButtonContainerTop_ - nativeButtonContainer_.frame.size.height)];
+                [nativeButtonContainer_ release];
+                nativeButtonContainer_ = nil;
+            }
+        }
+
         void restoreCloseButtonParent() {
+            restoreNativeButtonContainer();
             if (hostedCloseButton_ && closeButtonParent_) {
                 [closeButtonParent_ addSubview:hostedCloseButton_];
                 [hostedCloseButton_ setFrame:closeButtonOriginalFrame_];
@@ -632,6 +693,12 @@ namespace QWK {
             if (oldSetStyleMask) {
                 oldSetStyleMask(obj, sel, styleMask);
             }
+            // AppKit 更新可缩放等样式时会重置交通灯的 frame/hidden，
+            // QML 区域几何可能完全未变，不能等待下一次布局或 resize 才修正。
+            const auto proxy = g_proxyList->value(reinterpret_cast<WId>(nswindow.contentView));
+            if (proxy && proxy->closeButtonOnly) {
+                proxy->setSystemButtonVisible(proxy->systemButtonVisible);
+            }
         }
 
         static void setTitlebarAppearsTransparent(id obj, SEL sel, BOOL transparent) {
@@ -675,6 +742,9 @@ namespace QWK {
         NSView *closeButtonParent_ = nil;
         QWK_SystemButtonHost *closeButtonHost_ = nil;
         NSRect closeButtonOriginalFrame_ = NSZeroRect;
+        NSView *nativeButtonContainer_ = nil;
+        CGFloat nativeButtonContainerLeft_ = 0;
+        CGFloat nativeButtonContainerTop_ = 0;
         std::function<bool(const QPoint &)> titleBarHitTest_;
         std::function<void()> titleBarDoubleClick_;
         QWK_NSViewObserver* observer = nil;
