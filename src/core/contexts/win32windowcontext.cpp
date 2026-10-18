@@ -1006,6 +1006,19 @@ namespace QWK {
             return SUCCEEDED(apis.pDwmExtendFrameIntoClientArea(hwnd, &margins));
         }
 
+        if (key == QStringLiteral("no-window-border")) {
+            // 只抑制 Windows 11 描边，不改变非客户区、系统圆角或阴影策略。
+            if (!isWin11OrGreater() || attribute.userType() != QMetaType::Bool
+                || !apis.pDwmSetWindowAttribute) {
+                return false;
+            }
+            static constexpr COLORREF noBorder = 0xFFFFFFFE;
+            static constexpr COLORREF defaultBorder = 0xFFFFFFFF;
+            const COLORREF color = attribute.toBool() ? noBorder : defaultBorder;
+            return SUCCEEDED(apis.pDwmSetWindowAttribute(hwnd, _DWMWA_BORDER_COLOR,
+                                                       &color, sizeof(color)));
+        }
+
         if (key == QStringLiteral("dark-mode")) {
             if (!isWin101809OrGreater()) {
                 return false;
