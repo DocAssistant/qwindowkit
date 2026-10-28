@@ -392,23 +392,21 @@ namespace QWK {
                 midButton.hidden = YES;
                 rightButton.hidden = YES;
                 // 保持系统按钮及其原生父层关系；系统共享/hover/press 依赖此组。
-                // 只平移标题栏容器，使关闭中心与 QML 声明区域一致。
+                // 只定位标准按钮，保留标题栏及其外层容器的系统几何。
+                // 外层还承载窗口轮廓，整体移动会在客户区内多画一道线框。
                 NSView *container = leftButton.superview;
                 while (container.superview && container.superview != nsview.superview)
                     container = container.superview;
                 if (container && container != nsview.superview) {
-                    if (nativeButtonContainer_ != container) {
-                        restoreNativeButtonContainer();
-                        nativeButtonContainer_ = [container retain];
-                        nativeButtonContainerLeft_ = NSMinX(container.frame) - NSMinX(container.superview.bounds);
-                        nativeButtonContainerTop_ = NSMaxY(container.superview.bounds) - NSMaxY(container.frame);
+                    if (positionedCloseButton_ != leftButton) {
+                        restoreCloseButtonPosition();
+                        positionedCloseButton_ = [leftButton retain];
+                        positionedCloseButtonFrame_ = leftButton.frame;
                     }
-                    const NSPoint actual = [leftButton convertPoint:NSMakePoint(NSMidX(leftButton.bounds), NSMidY(leftButton.bounds)) toView:container.superview];
-                    const NSPoint desired = [nsview convertPoint:contentCenter toView:container.superview];
-                    const NSPoint origin = NSMakePoint(container.frame.origin.x + desired.x - actual.x,
-                        container.frame.origin.y + desired.y - actual.y);
-                    if (!NSEqualPoints(container.frame.origin, origin)) {
-                        [container setFrameOrigin:origin];
+                    const NSPoint origin = NSMakePoint(center.x() - leftButton.frame.size.width / 2,
+                        center.y() - leftButton.frame.size.height / 2);
+                    if (!NSEqualPoints(leftButton.frame.origin, origin)) {
+                        [leftButton setFrameOrigin:origin];
                         [titlebar updateTrackingAreas];
                     }
                     return;
@@ -474,18 +472,16 @@ namespace QWK {
             return {closeBtn, minimizeBtn, zoomBtn};
         }
 
-        void restoreNativeButtonContainer() {
-            if (nativeButtonContainer_) {
-                const NSRect parent = nativeButtonContainer_.superview.bounds;
-                [nativeButtonContainer_ setFrameOrigin:NSMakePoint(NSMinX(parent) + nativeButtonContainerLeft_,
-                    NSMaxY(parent) - nativeButtonContainerTop_ - nativeButtonContainer_.frame.size.height)];
-                [nativeButtonContainer_ release];
-                nativeButtonContainer_ = nil;
+        void restoreCloseButtonPosition() {
+            if (positionedCloseButton_) {
+                [positionedCloseButton_ setFrame:positionedCloseButtonFrame_];
+                [positionedCloseButton_ release];
+                positionedCloseButton_ = nil;
             }
         }
 
         void restoreCloseButtonParent() {
-            restoreNativeButtonContainer();
+            restoreCloseButtonPosition();
             if (hostedCloseButton_ && closeButtonParent_) {
                 [closeButtonParent_ addSubview:hostedCloseButton_];
                 [hostedCloseButton_ setFrame:closeButtonOriginalFrame_];
@@ -749,9 +745,8 @@ namespace QWK {
         NSView *closeButtonParent_ = nil;
         QWK_SystemButtonHost *closeButtonHost_ = nil;
         NSRect closeButtonOriginalFrame_ = NSZeroRect;
-        NSView *nativeButtonContainer_ = nil;
-        CGFloat nativeButtonContainerLeft_ = 0;
-        CGFloat nativeButtonContainerTop_ = 0;
+        NSButton *positionedCloseButton_ = nil;
+        NSRect positionedCloseButtonFrame_ = NSZeroRect;
         std::function<bool(const QPoint &)> titleBarHitTest_;
         std::function<void()> titleBarDoubleClick_;
         QWK_NSViewObserver* observer = nil;
