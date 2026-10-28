@@ -561,6 +561,13 @@ namespace QWK {
             [window invalidateShadow];
         }
 
+        // 原生窗口装饰必须与应用主题一致，避免深色客户区外围出现浅色边缘。
+        void setDarkMode(bool dark) {
+            auto window = [nsview window];
+            if (window)
+                window.appearance = [NSAppearance appearanceNamed:dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
+        }
+
         // System title bar
         void setSystemTitleBarVisible(const bool visible) {
             auto nswindow = [nsview window];
@@ -1010,6 +1017,8 @@ namespace QWK {
             proxy->setSystemButtonVisible(!windowAttribute(QStringLiteral("no-system-buttons")).toBool());
             proxy->setScreenRectCallback(m_systemButtonAreaCallback);
             proxy->setWindowShadowEnabled(!windowAttribute(QStringLiteral("no-window-shadow")).toBool());
+            if (windowAttribute(QStringLiteral("dark-mode")).isValid())
+                proxy->setDarkMode(windowAttribute(QStringLiteral("dark-mode")).toBool());
             proxy->setSystemTitleBarVisible(false);
         }
     }
@@ -1019,6 +1028,13 @@ namespace QWK {
         Q_UNUSED(oldAttribute)
 
         Q_ASSERT(m_windowId);
+
+        if (key == QStringLiteral("dark-mode")) {
+            if (attribute.userType() != QMetaType::Bool)
+                return false;
+            ensureWindowProxy(m_windowId)->setDarkMode(attribute.toBool());
+            return true;
+        }
 
         if (key == QStringLiteral("close-button-only")) {
             if (attribute.userType() != QMetaType::Bool)
