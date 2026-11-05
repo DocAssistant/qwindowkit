@@ -10,6 +10,7 @@
 #include <Cocoa/Cocoa.h>
 
 #include <QtGui/QGuiApplication>
+#include <QtGui/QMouseEvent>
 #include <functional>
 
 #include "qwkglobal_p.h"
@@ -295,9 +296,11 @@ namespace QWK {
         }
 
         void setTitleBarHitTest(const std::function<bool(const QPoint &)> &callback,
-                               const std::function<void()> &doubleClick) {
+                               const std::function<void()> &doubleClick,
+                               const std::function<void(const QPoint &)> &pressed) {
             titleBarHitTest_ = callback;
             titleBarDoubleClick_ = doubleClick;
+            titleBarPressed_ = pressed;
         }
 
         bool handleNativeDrag(NSEvent *event) {
@@ -315,6 +318,16 @@ namespace QWK {
             const QPoint scene(qRound(local.x), qRound(nsview.isFlipped ? local.y : nsview.bounds.size.height - local.y));
             if (!titleBarHitTest_(scene))
                 return false;
+            // 原生拖动会截走 mouseDown；先通知 Qt 的外部点击观察器，但不重放客户区按下。
+            // 观察器可能同步关闭/销毁窗口，回调及代理存活状态均须重新核验。
+            const WId viewId = reinterpret_cast<WId>(nsview);
+            const auto pressed = titleBarPressed_;
+            if (pressed)
+                pressed(scene);
+            if (g_proxyList->value(viewId) != this)
+                return true;
+            if (nsview.window != window || !window.visible)
+                return true;
             if (event.clickCount % 2 == 0) {
                 if (titleBarDoubleClick_)
                     titleBarDoubleClick_();
@@ -749,6 +762,7 @@ namespace QWK {
         NSRect positionedCloseButtonFrame_ = NSZeroRect;
         std::function<bool(const QPoint &)> titleBarHitTest_;
         std::function<void()> titleBarDoubleClick_;
+        std::function<void(const QPoint &)> titleBarPressed_;
         QWK_NSViewObserver* observer = nil;
 
         bool systemButtonVisible = true;
@@ -1007,6 +1021,14 @@ namespace QWK {
                 const auto state = delegate()->getWindowState(host());
                 if (!(state & Qt::WindowFullScreen))
                     delegate()->setWindowState(host(), state ^ Qt::WindowMaximized);
+            }, [this](const QPoint &point) {
+                const auto window = m_windowHandle;
+                if (!window)
+                    return;
+                QMouseEvent press(QEvent::NonClientAreaMouseButtonPress, point,
+                                  window->mapToGlobal(point), Qt::LeftButton, Qt::LeftButton,
+                                  QGuiApplication::keyboardModifiers());
+                QCoreApplication::sendEvent(window, &press);
             });
             proxy->setCloseButtonOnly(windowAttribute(QStringLiteral("close-button-only")).toBool());
             proxy->setSystemButtonVisible(!windowAttribute(QStringLiteral("no-system-buttons")).toBool());
