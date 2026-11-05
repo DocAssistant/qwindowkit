@@ -239,7 +239,8 @@ namespace QWK {
                 case DidUpdate: {
                     // 窗口共享等系统状态会重建按钮组，且不触发 Qt 几何/焦点变化。
                     // 在 AppKit 完成本轮更新后恢复原生按钮父层、位置及可见性。
-                    if (closeButtonOnly)
+                    if ((closeButtonOnly || screenRectCallback)
+                        && !(nsview.window.styleMask & NSWindowStyleMaskFullScreen))
                         setSystemButtonVisible(systemButtonVisible);
                     break;
                 }
@@ -452,26 +453,38 @@ namespace QWK {
                 return;
             }
 
+            // AppKit 会在窗口更新/样式变化时重排完整交通灯组；只在实际移动后刷新跟踪区。
+            const auto oldLeftFrame = leftButton.frame;
+            const auto oldMidFrame = midButton.frame;
+            const auto oldRightFrame = rightButton.frame;
+
             // Mid button
             NSPoint centerOrigin = {
                 center.x() - width / 2,
                 center.y() - height / 2,
             };
-            [midButton setFrameOrigin:centerOrigin];
+            if (!NSEqualPoints(midButton.frame.origin, centerOrigin))
+                [midButton setFrameOrigin:centerOrigin];
 
             // Left button
             NSPoint leftOrigin = {
                 centerOrigin.x - spacing,
                 centerOrigin.y,
             };
-            [leftButton setFrameOrigin:leftOrigin];
+            if (!NSEqualPoints(leftButton.frame.origin, leftOrigin))
+                [leftButton setFrameOrigin:leftOrigin];
 
             // Right button
             NSPoint rightOrigin = {
                 centerOrigin.x + spacing,
                 centerOrigin.y,
             };
-            [rightButton setFrameOrigin:rightOrigin];
+            if (!NSEqualPoints(rightButton.frame.origin, rightOrigin))
+                [rightButton setFrameOrigin:rightOrigin];
+            if (!NSEqualRects(oldLeftFrame, leftButton.frame)
+                || !NSEqualRects(oldMidFrame, midButton.frame)
+                || !NSEqualRects(oldRightFrame, rightButton.frame))
+                [titlebar updateTrackingAreas];
         }
 
         inline std::array<NSButton *, 3> systemButtons() {
@@ -712,7 +725,8 @@ namespace QWK {
             // AppKit 更新可缩放等样式时会重置交通灯的 frame/hidden，
             // QML 区域几何可能完全未变，不能等待下一次布局或 resize 才修正。
             const auto proxy = g_proxyList->value(reinterpret_cast<WId>(nswindow.contentView));
-            if (proxy && proxy->closeButtonOnly) {
+            if (proxy && (proxy->closeButtonOnly || proxy->screenRectCallback)
+                && !(nswindow.styleMask & NSWindowStyleMaskFullScreen)) {
                 proxy->setSystemButtonVisible(proxy->systemButtonVisible);
             }
         }
