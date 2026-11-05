@@ -11,6 +11,7 @@
 
 #include <QtGui/QGuiApplication>
 #include <QtGui/QMouseEvent>
+#include <algorithm>
 #include <functional>
 
 #include "qwkglobal_p.h"
@@ -25,16 +26,28 @@ namespace QWK {
 
     // 标题栏与窗口边缘重叠时，优先把可缩放方向交给 AppKit。
     // 带透明阴影边带的窗口继续使用其可见表面缩放路径。
-    static bool isInNativeResizeArea(AbstractWindowContext *context, const QPoint &pos) {
-        const auto window = context->window();
-        if (!window || window->visibility() != QWindow::Windowed || context->isHostSizeFixed()
-            || context->windowAttribute(QStringLiteral("resize-margin")).toReal() > 0)
-            return false;
+    static Qt::Edges nativeResizeEdges(const QWindow *window, const QPoint &pos) {
+        // macOS 的放大（zoom）窗口仍可拖边缩小；全屏与隐藏状态不参与。
+        if (!window || (window->visibility() != QWindow::Windowed
+                        && window->visibility() != QWindow::Maximized)
+            || (window->flags() & Qt::MSWindowsFixedSizeDialogHint))
+            return {};
         constexpr int border = 8;
-        return (!context->isHostWidthFixed()
-                && (pos.x() < border || pos.x() >= window->width() - border))
-            || (!context->isHostHeightFixed()
-                && (pos.y() < border || pos.y() >= window->height() - border));
+        Qt::Edges edges;
+        if (window->minimumWidth() != window->maximumWidth()) {
+            if (pos.x() < border) edges |= Qt::LeftEdge;
+            else if (pos.x() >= window->width() - border) edges |= Qt::RightEdge;
+        }
+        if (window->minimumHeight() != window->maximumHeight()) {
+            if (pos.y() < border) edges |= Qt::TopEdge;
+            else if (pos.y() >= window->height() - border) edges |= Qt::BottomEdge;
+        }
+        return edges;
+    }
+
+    static bool isInNativeResizeArea(AbstractWindowContext *context, const QPoint &pos) {
+        return context->windowAttribute(QStringLiteral("resize-margin")).toReal() <= 0
+            && nativeResizeEdges(context->window(), pos);
     }
 
     using ProxyList = QHash<WId, NSWindowProxy *>;
@@ -313,30 +326,80 @@ namespace QWK {
         void setTitleBarHitTest(QWindow *windowHandle,
                                const std::function<bool(const QPoint &)> &callback,
                                const std::function<void()> &doubleClick,
-                               const std::function<void(const QPoint &)> &pressed) {
+                               const std::function<void(const QPoint &)> &pressed,
+                               const std::function<bool(const QPoint &)> &nativeResizeHitTest) {
             windowHandle_ = windowHandle;
             titleBarHitTest_ = callback;
             titleBarDoubleClick_ = doubleClick;
             titleBarPressed_ = pressed;
+            nativeResizeHitTest_ = nativeResizeHitTest;
         }
 
         bool handleNativeDrag(NSEvent *event) {
-            if (event.type != NSEventTypeLeftMouseDown || !titleBarHitTest_)
+            if (!titleBarHitTest_)
                 return false;
             auto window = nsview.window;
             if (!window || !windowHandle_ || nsview.bounds.size.width <= 0
-                || nsview.bounds.size.height <= 0 || (window.styleMask & NSWindowStyleMaskFullScreen))
+                || nsview.bounds.size.height <= 0 || !window.visible
+                || (window.styleMask & NSWindowStyleMaskFullScreen)) {
+                nativeResizeEdges_ = {};
                 return false;
+            }
             const NSPoint local = [nsview convertPoint:event.locationInWindow fromView:nil];
-            for (const auto button : systemButtons()) {
-                if (button && !button.hidden &&
-                    NSPointInRect(local, [button convertRect:button.bounds toView:nsview]))
-                    return false;
+            if (event.type == NSEventTypeLeftMouseDown) {
+                for (const auto button : systemButtons()) {
+                    if (button && !button.hidden &&
+                        NSPointInRect(local, [button convertRect:button.bounds toView:nsview]))
+                        return false;
+                }
             }
             // NSView 点与 Qt 逻辑像素在分数倍率下并不相同。
             const QPoint scene(qRound(local.x * windowHandle_->width() / nsview.bounds.size.width),
                 qRound((nsview.isFlipped ? local.y : nsview.bounds.size.height - local.y)
                        * windowHandle_->height() / nsview.bounds.size.height));
+            const QPoint global = windowHandle_->mapToGlobal(scene);
+            if (event.type == NSEventTypeLeftMouseUp && nativeResizeEdges_) {
+                nativeResizeEdges_ = {};
+                return true;
+            }
+            if (event.type == NSEventTypeLeftMouseDragged && nativeResizeEdges_) {
+                const auto qtWindow = windowHandle_;
+                const QPoint delta = global - nativeResizeStart_;
+                QRect geometry = nativeResizeGeometry_;
+                const int width = std::clamp(geometry.width()
+                    + (nativeResizeEdges_.testFlag(Qt::LeftEdge) ? -delta.x() : delta.x()),
+                    std::max(1, qtWindow->minimumWidth()),
+                    std::max({1, qtWindow->minimumWidth(), qtWindow->maximumWidth()}));
+                const int height = std::clamp(geometry.height()
+                    + (nativeResizeEdges_.testFlag(Qt::TopEdge) ? -delta.y() : delta.y()),
+                    std::max(1, qtWindow->minimumHeight()),
+                    std::max({1, qtWindow->minimumHeight(), qtWindow->maximumHeight()}));
+                if (nativeResizeEdges_.testFlag(Qt::LeftEdge)) geometry.setLeft(geometry.right() + 1 - width);
+                else if (nativeResizeEdges_.testFlag(Qt::RightEdge)) geometry.setWidth(width);
+                if (nativeResizeEdges_.testFlag(Qt::TopEdge)) geometry.setTop(geometry.bottom() + 1 - height);
+                else if (nativeResizeEdges_.testFlag(Qt::BottomEdge)) geometry.setHeight(height);
+                // AppKit放大窗口可能不接纳角部系统缩放；在首次尺寸变化时退出放大，
+                // 同一事件内应用有界几何，保留对侧锚点，不先呈现旧的普通窗口尺寸。
+                if (qtWindow->windowState() == Qt::WindowMaximized)
+                    qtWindow->setWindowState(Qt::WindowNoState);
+                if (qtWindow) qtWindow->setGeometry(geometry);
+                return true;
+            }
+            if (event.type != NSEventTypeLeftMouseDown) {
+                if (event.type == NSEventTypeMouseMoved) nativeResizeEdges_ = {};
+                return false;
+            }
+            nativeResizeEdges_ = {};
+            const Qt::Edges resizeEdges = nativeResizeEdges(windowHandle_, scene);
+            const bool upperCorner = resizeEdges.testFlag(Qt::TopEdge)
+                && (resizeEdges.testFlag(Qt::LeftEdge) || resizeEdges.testFlag(Qt::RightEdge));
+            if ((upperCorner || windowHandle_->visibility() == QWindow::Maximized)
+                && nativeResizeHitTest_ && nativeResizeHitTest_(scene)) {
+                nativeResizeEdges_ = resizeEdges;
+                nativeResizeStart_ = global;
+                nativeResizeGeometry_ = windowHandle_->geometry();
+                return bool(nativeResizeEdges_);
+            }
             if (!titleBarHitTest_(scene))
                 return false;
             // 原生拖动会截走 mouseDown；先通知 Qt 的外部点击观察器，但不重放客户区按下。
@@ -635,8 +698,9 @@ namespace QWK {
         }
 
         static void replaceImplementations() {
-            // 本地事件入口早于 Qt Quick 的延迟投递；只消费标题栏空白区域的按下。
-            nativeDragMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown
+            // 本地入口早于 Qt Quick 的延迟投递；先处理角部缩放，再接管标题栏空白拖动。
+            nativeDragMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
+                NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp | NSEventMaskMouseMoved
                 handler:^NSEvent *(NSEvent *event) {
                     auto proxy = g_proxyList->value(reinterpret_cast<WId>(event.window.contentView));
                     return proxy && proxy->handleNativeDrag(event) ? nil : event;
@@ -795,6 +859,10 @@ namespace QWK {
         NSButton *positionedCloseButton_ = nil;
         NSRect positionedCloseButtonFrame_ = NSZeroRect;
         QPointer<QWindow> windowHandle_;
+        Qt::Edges nativeResizeEdges_;
+        QPoint nativeResizeStart_;
+        QRect nativeResizeGeometry_;
+        std::function<bool(const QPoint &)> nativeResizeHitTest_;
         std::function<bool(const QPoint &)> titleBarHitTest_;
         std::function<void()> titleBarDoubleClick_;
         std::function<void(const QPoint &)> titleBarPressed_;
@@ -1065,6 +1133,8 @@ namespace QWK {
                                   window->mapToGlobal(point), Qt::LeftButton, Qt::LeftButton,
                                   QGuiApplication::keyboardModifiers());
                 QCoreApplication::sendEvent(window, &press);
+            }, [this](const QPoint &point) {
+                return isInNativeResizeArea(this, point);
             });
             proxy->setCloseButtonOnly(windowAttribute(QStringLiteral("close-button-only")).toBool());
             proxy->setSystemButtonVisible(!windowAttribute(QStringLiteral("no-system-buttons")).toBool());
