@@ -23,6 +23,20 @@ namespace QWK {
 
     struct NSWindowProxy;
 
+    // 标题栏与窗口边缘重叠时，优先把可缩放方向交给 AppKit。
+    // 带透明阴影边带的窗口继续使用其可见表面缩放路径。
+    static bool isInNativeResizeArea(AbstractWindowContext *context, const QPoint &pos) {
+        const auto window = context->window();
+        if (!window || window->visibility() != QWindow::Windowed || context->isHostSizeFixed()
+            || context->windowAttribute(QStringLiteral("resize-margin")).toReal() > 0)
+            return false;
+        constexpr int border = 8;
+        return (!context->isHostWidthFixed()
+                && (pos.x() < border || pos.x() >= window->width() - border))
+            || (!context->isHostHeightFixed()
+                && (pos.y() < border || pos.y() >= window->height() - border));
+    }
+
     using ProxyList = QHash<WId, NSWindowProxy *>;
     Q_GLOBAL_STATIC(ProxyList, g_proxyList);
 }
@@ -296,9 +310,11 @@ namespace QWK {
             setSystemButtonVisible(systemButtonVisible);
         }
 
-        void setTitleBarHitTest(const std::function<bool(const QPoint &)> &callback,
+        void setTitleBarHitTest(QWindow *windowHandle,
+                               const std::function<bool(const QPoint &)> &callback,
                                const std::function<void()> &doubleClick,
                                const std::function<void(const QPoint &)> &pressed) {
+            windowHandle_ = windowHandle;
             titleBarHitTest_ = callback;
             titleBarDoubleClick_ = doubleClick;
             titleBarPressed_ = pressed;
@@ -308,7 +324,8 @@ namespace QWK {
             if (event.type != NSEventTypeLeftMouseDown || !titleBarHitTest_)
                 return false;
             auto window = nsview.window;
-            if (!window || (window.styleMask & NSWindowStyleMaskFullScreen))
+            if (!window || !windowHandle_ || nsview.bounds.size.width <= 0
+                || nsview.bounds.size.height <= 0 || (window.styleMask & NSWindowStyleMaskFullScreen))
                 return false;
             const NSPoint local = [nsview convertPoint:event.locationInWindow fromView:nil];
             for (const auto button : systemButtons()) {
@@ -316,7 +333,10 @@ namespace QWK {
                     NSPointInRect(local, [button convertRect:button.bounds toView:nsview]))
                     return false;
             }
-            const QPoint scene(qRound(local.x), qRound(nsview.isFlipped ? local.y : nsview.bounds.size.height - local.y));
+            // NSView 点与 Qt 逻辑像素在分数倍率下并不相同。
+            const QPoint scene(qRound(local.x * windowHandle_->width() / nsview.bounds.size.width),
+                qRound((nsview.isFlipped ? local.y : nsview.bounds.size.height - local.y)
+                       * windowHandle_->height() / nsview.bounds.size.height));
             if (!titleBarHitTest_(scene))
                 return false;
             // 原生拖动会截走 mouseDown；先通知 Qt 的外部点击观察器，但不重放客户区按下。
@@ -774,6 +794,7 @@ namespace QWK {
         NSRect closeButtonOriginalFrame_ = NSZeroRect;
         NSButton *positionedCloseButton_ = nil;
         NSRect positionedCloseButtonFrame_ = NSZeroRect;
+        QPointer<QWindow> windowHandle_;
         std::function<bool(const QPoint &)> titleBarHitTest_;
         std::function<void()> titleBarDoubleClick_;
         std::function<void(const QPoint &)> titleBarPressed_;
@@ -883,7 +904,8 @@ namespace QWK {
         QPoint scenePos = getMouseEventScenePos(me);
         QPoint globalPos = getMouseEventGlobalPos(me);
 
-        bool inTitleBar = m_context->isInTitleBarDraggableArea(scenePos);
+        bool inTitleBar = !isInNativeResizeArea(m_context, scenePos)
+            && m_context->isInTitleBarDraggableArea(scenePos);
         switch (type) {
             case QEvent::MouseButtonPress: {
                 switch (me->button()) {
@@ -1027,8 +1049,8 @@ namespace QWK {
         // Allocate new resources
         const auto proxy = ensureWindowProxy(winId);
         if (proxy) {
-            proxy->setTitleBarHitTest([this](const QPoint &point) {
-                return isInTitleBarDraggableArea(point);
+            proxy->setTitleBarHitTest(m_windowHandle, [this](const QPoint &point) {
+                return !isInNativeResizeArea(this, point) && isInTitleBarDraggableArea(point);
             }, [this]() {
                 if (isHostSizeFixed())
                     return;
