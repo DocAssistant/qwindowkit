@@ -1178,7 +1178,7 @@ namespace QWK {
             effectBugWorkaround();
             return true;
         }
-        return false;
+        return AbstractWindowContext::windowAttributeChanged(key, attribute, oldAttribute);
     }
 
     QWK_USED static constexpr const struct {
@@ -1658,6 +1658,12 @@ namespace QWK {
                 WindowAgentBase::SystemButton sysButtonType = WindowAgentBase::Unknown;
                 bool isInCaptionButtons = isInSystemButtons(qtScenePos, &sysButtonType);
                 static constexpr bool dontOverrideCursor = false; // ### TODO
+
+                if (resizeMargin() > 0) {
+                    // 自绘阴影只是透明客户区；缩放交由共用的可见边框命中与Qt系统入口。
+                    *result = isInTitleBar ? HTCAPTION : HTCLIENT;
+                    return true;
+                }
 
                 if (isInCaptionButtons) {
                     // Firstly, we set the hit test result to a default value to be able to detect

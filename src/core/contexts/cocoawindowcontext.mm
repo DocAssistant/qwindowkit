@@ -323,6 +323,11 @@ namespace QWK {
             setSystemButtonVisible(systemButtonVisible);
         }
 
+        void setCustomResizeEnabled(bool enabled) {
+            customResizeEnabled_ = enabled;
+            setSystemTitleBarVisible(false);
+        }
+
         void setTitleBarHitTest(QWindow *windowHandle,
                                const std::function<bool(const QPoint &)> &callback,
                                const std::function<void()> &doubleClick,
@@ -681,7 +686,10 @@ namespace QWK {
             }
 
             nsview.wantsLayer = YES;
-            nswindow.styleMask |= NSWindowStyleMaskResizable;
+            if (customResizeEnabled_)
+                nswindow.styleMask &= ~NSWindowStyleMaskResizable;
+            else
+                nswindow.styleMask |= NSWindowStyleMaskResizable;
             if (visible) {
                 nswindow.styleMask &= ~NSWindowStyleMaskFullSizeContentView;
             } else {
@@ -801,6 +809,9 @@ namespace QWK {
             auto nsview = [nswindow contentView];
             if (g_proxyList->contains(reinterpret_cast<WId>(nsview))) {
                 styleMask |= NSWindowStyleMaskFullSizeContentView;
+                const auto proxy = g_proxyList->value(reinterpret_cast<WId>(nsview));
+                if (proxy && proxy->customResizeEnabled_)
+                    styleMask &= ~NSWindowStyleMaskResizable;
             }
 
             if (oldSetStyleMask) {
@@ -871,6 +882,7 @@ namespace QWK {
         bool systemButtonVisible = true;
         bool windowShadowEnabled = true;
         bool closeButtonOnly = false;
+        bool customResizeEnabled_ = false;
         ScreenRectCallback screenRectCallback;
 
         static inline QWK_NSWindowObserver *windowObserver = nil;
@@ -1140,6 +1152,7 @@ namespace QWK {
             proxy->setSystemButtonVisible(!windowAttribute(QStringLiteral("no-system-buttons")).toBool());
             proxy->setScreenRectCallback(m_systemButtonAreaCallback);
             proxy->setWindowShadowEnabled(!windowAttribute(QStringLiteral("no-window-shadow")).toBool());
+            proxy->setCustomResizeEnabled(resizeMargin() > 0);
             if (windowAttribute(QStringLiteral("dark-mode")).isValid())
                 proxy->setDarkMode(windowAttribute(QStringLiteral("dark-mode")).toBool());
             proxy->setSystemTitleBarVisible(false);
@@ -1151,6 +1164,13 @@ namespace QWK {
         Q_UNUSED(oldAttribute)
 
         Q_ASSERT(m_windowId);
+
+        if (key == QStringLiteral("resize-margin")) {
+            if (!AbstractWindowContext::windowAttributeChanged(key, attribute, oldAttribute))
+                return false;
+            ensureWindowProxy(m_windowId)->setCustomResizeEnabled(attribute.toReal() > 0);
+            return true;
+        }
 
         if (key == QStringLiteral("dark-mode")) {
             if (attribute.userType() != QMetaType::Bool)

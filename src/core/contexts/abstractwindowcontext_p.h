@@ -65,6 +65,10 @@ namespace QWK {
         bool isInSystemButtons(const QPoint &pos, WindowAgentBase::SystemButton *button) const;
         bool isInTitleBarDraggableArea(const QPoint &pos) const;
 
+        // 透明阴影边带不属于可调整大小的窗口表面，单位为 Qt 逻辑像素。
+        qreal resizeMargin() const;
+        Qt::Edges resizeEdgesAt(const QPoint &pos) const;
+
         inline bool isHostWidthFixed() const {
             return m_windowHandle
                        ? ((m_windowHandle->flags() & Qt::MSWindowsFixedSizeDialogHint) ||
@@ -130,6 +134,15 @@ namespace QWK {
         std::unique_ptr<WinIdChangeEventFilter> m_winIdChangeEventFilter;
 
         void removeSystemButtonsAndHitTestItems();
+
+    private:
+        bool handleCustomResizeEvent(QEvent *event);
+        void resetCustomResize();
+        Qt::Edges resizeEdges_;
+        QPoint resizeStartPosition_;
+        QRect resizeStartGeometry_;
+        bool resizeCursorChanged_ = false;
+        bool resizeMouseGrabbed_ = false;
     };
 
     inline QObject *AbstractWindowContext::host() const {

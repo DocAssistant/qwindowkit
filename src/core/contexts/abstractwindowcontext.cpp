@@ -7,6 +7,10 @@
 #include <QtGui/QPen>
 #include <QtGui/QPainter>
 #include <QtGui/QScreen>
+#include <QtGui/QMouseEvent>
+#include <QtGui/QGuiApplication>
+#include <algorithm>
+#include <cmath>
 
 #include "qwkglobal_p.h"
 
@@ -100,6 +104,8 @@ namespace QWK {
     }
 
     bool AbstractWindowContext::isInTitleBarDraggableArea(const QPoint &pos) const {
+        if (resizeMargin() > 0 && resizeEdgesAt(pos))
+            return false;
         if (!m_titleBar) {
             // There's no title bar at all, the mouse will always be in the client area.
             return false;
@@ -272,8 +278,131 @@ namespace QWK {
         return true;
     }
 
+    qreal AbstractWindowContext::resizeMargin() const {
+        return windowAttribute(QStringLiteral("resize-margin")).toReal();
+    }
+
+    Qt::Edges AbstractWindowContext::resizeEdgesAt(const QPoint &pos) const {
+        if (!m_windowHandle || m_windowHandle->visibility() != QWindow::Windowed
+            || isHostSizeFixed())
+            return {};
+        const qreal margin = resizeMargin();
+        const QRectF surface(margin, margin, m_windowHandle->width() - 2 * margin,
+                             m_windowHandle->height() - 2 * margin);
+        // 保留既有8px命中宽度，在可见边框内外各分配一半。
+        constexpr qreal halfBorder = 4;
+        if (surface.isEmpty() || !surface.adjusted(-halfBorder, -halfBorder,
+                                                    halfBorder, halfBorder).contains(pos))
+            return {};
+        Qt::Edges edges;
+        if (!isHostWidthFixed()) {
+            if (std::abs(pos.x() - surface.left()) <= halfBorder) edges |= Qt::LeftEdge;
+            else if (std::abs(pos.x() - surface.right()) <= halfBorder) edges |= Qt::RightEdge;
+        }
+        if (!isHostHeightFixed()) {
+            if (std::abs(pos.y() - surface.top()) <= halfBorder) edges |= Qt::TopEdge;
+            else if (std::abs(pos.y() - surface.bottom()) <= halfBorder) edges |= Qt::BottomEdge;
+        }
+        return edges;
+    }
+
+    void AbstractWindowContext::resetCustomResize() {
+        resizeEdges_ = {};
+        const bool grabbed = std::exchange(resizeMouseGrabbed_, false);
+        if (m_windowHandle && grabbed) m_windowHandle->setMouseGrabEnabled(false);
+        if (std::exchange(resizeCursorChanged_, false) && m_windowHandle)
+            m_delegate->restoreCursorShape(m_host);
+    }
+
+    bool AbstractWindowContext::handleCustomResizeEvent(QEvent *event) {
+        if (resizeMargin() <= 0) return false;
+        const auto type = event->type();
+        if (type == QEvent::Hide || type == QEvent::WindowDeactivate
+            || type == QEvent::WindowStateChange || type == QEvent::UngrabMouse) {
+            resetCustomResize();
+            return false;
+        }
+        if (type != QEvent::MouseMove && type != QEvent::MouseButtonPress
+            && type != QEvent::MouseButtonRelease)
+            return false;
+        auto *mouse = static_cast<QMouseEvent *>(event);
+        const auto window = m_windowHandle;
+        if (type == QEvent::MouseButtonRelease && mouse->button() == Qt::LeftButton
+            && resizeEdges_) {
+            resetCustomResize();
+            event->accept();
+            return true;
+        }
+        if (type == QEvent::MouseMove && resizeEdges_) {
+            if (!(mouse->buttons() & Qt::LeftButton)) {
+                resetCustomResize();
+                return false;
+            }
+            const QPoint delta = getMouseEventGlobalPos(mouse) - resizeStartPosition_;
+            QRect geometry = resizeStartGeometry_;
+            const int minWidth = std::max(1, window->minimumWidth());
+            const int minHeight = std::max(1, window->minimumHeight());
+            const int maxWidth = std::max(minWidth, window->maximumWidth());
+            const int maxHeight = std::max(minHeight, window->maximumHeight());
+            if (resizeEdges_.testFlag(Qt::LeftEdge)) {
+                const int width = std::clamp(geometry.width() - delta.x(), minWidth, maxWidth);
+                geometry.setLeft(geometry.right() + 1 - width);
+            } else if (resizeEdges_.testFlag(Qt::RightEdge)) {
+                geometry.setWidth(std::clamp(geometry.width() + delta.x(), minWidth, maxWidth));
+            }
+            if (resizeEdges_.testFlag(Qt::TopEdge)) {
+                const int height = std::clamp(geometry.height() - delta.y(), minHeight, maxHeight);
+                geometry.setTop(geometry.bottom() + 1 - height);
+            } else if (resizeEdges_.testFlag(Qt::BottomEdge)) {
+                geometry.setHeight(std::clamp(geometry.height() + delta.y(), minHeight, maxHeight));
+            }
+            window->setGeometry(geometry);
+            event->accept();
+            return true;
+        }
+        const Qt::Edges edges = resizeEdgesAt(getMouseEventScenePos(mouse));
+        if (type == QEvent::MouseMove && mouse->buttons() == Qt::NoButton) {
+            if (!edges) {
+                if (std::exchange(resizeCursorChanged_, false))
+                    m_delegate->restoreCursorShape(m_host);
+                return false;
+            }
+            const bool horizontal = edges.testFlag(Qt::LeftEdge) || edges.testFlag(Qt::RightEdge);
+            const bool vertical = edges.testFlag(Qt::TopEdge) || edges.testFlag(Qt::BottomEdge);
+            const bool forward = (edges.testFlag(Qt::LeftEdge) && edges.testFlag(Qt::TopEdge))
+                              || (edges.testFlag(Qt::RightEdge) && edges.testFlag(Qt::BottomEdge));
+            m_delegate->setCursorShape(m_host, horizontal && vertical
+                ? (forward ? Qt::SizeFDiagCursor : Qt::SizeBDiagCursor)
+                : horizontal ? Qt::SizeHorCursor : Qt::SizeVerCursor);
+            resizeCursorChanged_ = true;
+            event->accept();
+            return true;
+        }
+        if (type != QEvent::MouseButtonPress || mouse->button() != Qt::LeftButton || !edges)
+            return false;
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+        if (window->startSystemResize(edges)) {
+            event->accept();
+            return true;
+        }
+#endif
+        // Cocoa缺少系统resize入口；使用同一逻辑坐标和尺寸约束回退。
+        // Wayland不允许任意设置顶层位置，系统拒绝时明确报告，不能假装成功。
+        if (QGuiApplication::platformName().startsWith(QStringLiteral("wayland"))) {
+            qWarning() << "QWindowKit: compositor rejected resizing at the visible window border";
+            return false;
+        }
+        resizeEdges_ = edges;
+        resizeStartPosition_ = getMouseEventGlobalPos(mouse);
+        resizeStartGeometry_ = window->geometry();
+        resizeMouseGrabbed_ = window->setMouseGrabEnabled(true);
+        event->accept();
+        return true;
+    }
+
     bool AbstractWindowContext::eventFilter(QObject *obj, QEvent *event) {
-        if (obj == m_windowHandle && sharedDispatch(obj, event)) {
+        if (obj == m_windowHandle
+            && (handleCustomResizeEvent(event) || sharedDispatch(obj, event))) {
             return true;
         }
         return QObject::eventFilter(obj, event);
@@ -282,6 +411,13 @@ namespace QWK {
     bool AbstractWindowContext::windowAttributeChanged(const QString &key,
                                                        const QVariant &attribute,
                                                        const QVariant &oldAttribute) {
+        if (key == QStringLiteral("resize-margin")) {
+            bool valid = false;
+            const qreal margin = attribute.toDouble(&valid);
+            if (!valid || !std::isfinite(margin) || margin < 0) return false;
+            resetCustomResize();
+            return true;
+        }
         return false;
     }
 

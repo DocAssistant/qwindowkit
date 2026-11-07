@@ -129,6 +129,13 @@ namespace QWK {
         bool inTitleBar = m_context->isInTitleBarDraggableArea(scenePos);
 
         const auto& updateCursorShape{ [&](){
+            if (m_context->resizeMargin() > 0) {
+                if (m_cursorShapeChanged) {
+                    delegate->restoreCursorShape(host);
+                    m_cursorShapeChanged = false;
+                }
+                return;
+            }
             if (fixedSize) {
                 return;
             }
@@ -151,7 +158,7 @@ namespace QWK {
                 m_windowStatus = WaitingRelease;
                 switch (me->button()) {
                     case Qt::LeftButton: {
-                        if (!fixedSize) {
+                        if (!fixedSize && m_context->resizeMargin() <= 0) {
                             Qt::Edges edges = calculateWindowEdges(window, scenePos);
                             if (edges != Qt::Edges()) {
                                 startSystemResize(window, edges);
